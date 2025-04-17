@@ -31,7 +31,7 @@ function App() {
           }
         }
       } catch (err) {
-        console.error('Error restoring servers:', err);
+        addLog({ type: 'error', message: `Error restoring servers: ${err.message}` });
       }
       fetchServers();
     };
@@ -54,8 +54,7 @@ function App() {
         setSelectedServer(res.data[0]);
       }
     } catch (e) {
-      console.error(e);
-      addLog({ type: 'error', message: 'Failed to fetch servers.' });
+      addLog({ type: 'error', message: `Failed to fetch servers: ${e.message}` });
     }
   };
 
@@ -68,8 +67,7 @@ function App() {
       const res = await axios.get(url);
       setTools(res.data);
     } catch (e) {
-      console.error(e);
-      addLog({ type: 'error', message: 'Failed to fetch tools.' });
+      addLog({ type: 'error', message: `Failed to fetch tools: ${e.message}` });
     }
   };
 
@@ -88,8 +86,7 @@ function App() {
       setChatSessionId(session_id);
       addLog({ type: 'assistant', message: response });
     } catch (e) {
-      console.error(e);
-      addLog({ type: 'error', message: 'Error during chat.' });
+      addLog({ type: 'error', message: `Error during chat: ${e.message}` });
     }
   };
 
@@ -111,8 +108,7 @@ function App() {
       };
       setConnectionHistory(prev => [...prev, entry]);
     } catch (e) {
-      console.error(e);
-      addLog({ type: 'error', message: 'Error adding server.' });
+      addLog({ type: 'error', message: `Error adding server: ${e.message}` });
     }
   };
 
@@ -121,8 +117,7 @@ function App() {
       await axios.delete(`http://localhost:8000/servers/${name}`);
       addLog({ type: 'info', message: `Server ${name} deleted.` });
     } catch (e) {
-      console.error(e);
-      addLog({ type: 'error', message: 'Error deleting server.' });
+      addLog({ type: 'error', message: `Error deleting server: ${e.message}` });
     } finally {
       fetchServers();
       if (selectedServer === name) setSelectedServer(null);

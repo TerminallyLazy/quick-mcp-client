@@ -9,6 +9,7 @@ import json
 from contextlib import AsyncExitStack
 from uuid import uuid4
 import tempfile
+from fastapi.encoders import jsonable_encoder
 
 import openai
 from dotenv import load_dotenv
@@ -39,6 +40,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     response: str
+    function_call_name: Optional[str] = None
+    function_call_arguments: Optional[Dict[str, Any]] = None
 
 # MCP Server wrapper
 from mcp import ClientSession, StdioServerParameters
@@ -147,6 +150,19 @@ class ServerManager:
             all_tools.extend(await server.list_tools())
         return all_tools
 
+    async def call_tool(self, tool_name: str, arguments: dict):
+        # Delegate tool invocation to the server exposing this tool
+        for server in self.servers.values():
+            try:
+                tools = await server.list_tools()
+            except Exception:
+                continue
+            # Find matching tool by name
+            if any(t.name == tool_name for t in tools):
+                return await server.call_tool(tool_name, arguments)
+        # If no server has the tool, raise an error
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found on any server")
+
 # Chat session manager
 class ChatManager:
     def __init__(self, server_manager: ServerManager):
@@ -155,48 +171,78 @@ class ChatManager:
 
     async def chat(self, req: ChatRequest) -> ChatResponse:
         sid = req.session_id or str(uuid4())
+        # Fetch current tools and update system message
+        tools = await self.sm.list_tools()
+        tools_desc = "\n".join([f"{t.name}: {t.description}" for t in tools])
+        system_msg = (
+            "You are a helpful assistant with access to these tools:\n"
+            f"{tools_desc}\n\n"
+            "When you need to use a tool, always call it immediately without asking for user confirmation. "
+            "Respond ONLY with a JSON object matching the function call in the exact format below, and nothing else:\n"
+            "{\n"
+            '    "tool": "tool-name",\n'
+            '    "arguments": { /* argument names and values */ }\n'
+            "}\n"
+            "Do not output any descriptive text when invoking a tool. After the tool runs, continue the conversation naturally."
+        )
         if sid not in self.sessions:
-            tools = await self.sm.list_tools()
-            tools_desc = "\n".join([f"{t.name}: {t.description}" for t in tools])
-            system_msg = (
-                "You are a helpful assistant with access to these tools:\n"
-                f"{tools_desc}\n\n"
-                "When you need to use a tool, respond ONLY with a JSON object in the exact format below and nothing else:\n"
-                "{\n"
-                '    "tool": "tool-name",\n'
-                '    "arguments": { /* argument names and values */ }\n'
-                "}\n"
-                "After the tool runs, you will receive the result and should continue the conversation naturally."
-            )
+            # Initialize session with system message
             self.sessions[sid] = {"messages": [{"role": "system", "content": system_msg}]}
+        else:
+            # Refresh system message for new servers/tools
+            self.sessions[sid]["messages"][0]["content"] = system_msg
         session = self.sessions[sid]
         session["messages"].append({"role": "user", "content": req.message})
         # Prepare and call OpenAI with all MCP server tools as functions
         client = OpenAI(api_key=OPENAI_API_KEY)
         tools = await self.sm.list_tools()
-        functions_defs = [
-            {"name": t.name, "description": t.description, "parameters": t.input_schema}
-            for t in tools
-        ]
-        resp = client.chat.completions.create(
-            model="o4-mini",
-            messages=session["messages"],
-            functions=functions_defs,
-            function_call="auto"
-        )
+        # Build valid JSON schemas for each function; default to empty object if schema missing
+        functions_defs = []
+        for t in tools:
+            raw_schema = t.input_schema or {}
+            if isinstance(raw_schema, dict) and raw_schema.get("type") == "object" and "properties" in raw_schema:
+                params = raw_schema
+            else:
+                # Fallback to an empty object schema
+                params = {"type": "object", "properties": {}, "required": []}
+            functions_defs.append({"name": t.name, "description": t.description, "parameters": params})
+        # Attempt chat with function definitions; fallback on schema errors
+        use_functions = True
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=session["messages"],
+                functions=functions_defs,
+                function_call="auto"
+            )
+        except openai.BadRequestError as e:
+            # Invalid function schema; retry without functions
+            print(f"Function schema invalid, skipping functions: {e}")
+            resp = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=session["messages"]
+            )
+            use_functions = False
         message = resp.choices[0].message
-        # Handle tool invocation if selected
-        if getattr(message, "function_call", None):
+        func_call_name = None
+        func_call_args = None
+        # Handle tool invocation only if functions were used and a tool was called
+        if use_functions and getattr(message, "function_call", None):
             func_name = message.function_call.name
             args = json.loads(message.function_call.arguments)
+            # capture for response
+            func_call_name = func_name
+            func_call_args = args
             try:
                 result = await self.sm.call_tool(func_name, args)
+                # Ensure result is JSON serializable
+                encoded = jsonable_encoder(result)
                 session["messages"].append({
-                    "role": "function", "name": func_name, "content": json.dumps(result)
+                    "role": "function", "name": func_name, "content": json.dumps(encoded)
                 })
                 # Get final assistant reply
                 resp2 = client.chat.completions.create(
-                    model="o4-mini", messages=session["messages"]
+                    model="gpt-4.1", messages=session["messages"]
                 )
                 final_msg = resp2.choices[0].message
                 content = final_msg.content or ""
@@ -206,8 +252,13 @@ class ChatManager:
         else:
             content = message.content or ""
         session["messages"].append({"role": "assistant", "content": content})
-        # Ensure response is a string
-        return ChatResponse(session_id=sid, response=content or "")
+        # Return content and any function call info
+        return ChatResponse(
+            session_id=sid,
+            response=content or "",
+            function_call_name=func_call_name,
+            function_call_arguments=func_call_args
+        )
 
 # Initialize FastAPI app
 app = FastAPI()

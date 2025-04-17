@@ -45,3 +45,9 @@ backend/mcp_config.json.bak
 backend/mcp_config.json.bak.2
 
 
+
+backend/__pycache__
+backend/mcp_config.json.bak
+backend/__pycache__/main.cpython-313.pyc
+
+backend/
